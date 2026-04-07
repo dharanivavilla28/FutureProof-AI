@@ -2,24 +2,12 @@ import { useState, useRef } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import { Upload, FileText, CheckCircle, AlertCircle, TrendingUp, TrendingDown, Minus, Sparkles, X } from 'lucide-react'
 
-const MOCK_SKILLS = {
-  found:    ['Python', 'React', 'Machine Learning', 'SQL', 'Docker', 'AWS', 'TensorFlow', 'REST APIs'],
-  gaps:     ['Kubernetes', 'MLOps', 'Spark', 'LLM Fine-tuning'],
-  trending: ['LangChain', 'RAG Pipelines', 'Vector DBs', 'TypeScript'],
-}
-
-const MOCK_SUGGESTIONS = [
-  { course: 'MLOps Professional Certificate', platform: 'Coursera', impact: 'High', time: '3 months' },
-  { course: 'Kubernetes for AI Engineers',    platform: 'Udemy',    impact: 'High', time: '6 weeks' },
-  { course: 'LLM Fine-tuning Masterclass',   platform: 'DeepLearning.AI', impact: 'Critical', time: '4 weeks' },
-  { course: 'Apache Spark Fundamentals',     platform: 'edX',      impact: 'Medium', time: '2 months' },
-]
-
 export default function ResumeAnalyzer() {
   const [step, setStep] = useState('upload') // upload | analyzing | results
   const [fileName, setFileName] = useState(null)
   const [progress, setProgress] = useState(0)
   const [resumeText, setResumeText] = useState('')
+  const [results, setResults] = useState(null)
   const dropRef = useRef()
 
   function handleFile(file) {
@@ -27,12 +15,45 @@ export default function ResumeAnalyzer() {
     setFileName(file.name)
     setStep('analyzing')
     setProgress(0)
+    setResults(null)
+    
+    const formData = new FormData();
+    if (file.name === 'pasted-resume.txt') {
+      // Send text as JSON
+      fetch('http://localhost:5000/api/resume/analyze', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: resumeText })
+      }).then(res => res.json()).then(processData).catch(handleError)
+    } else {
+      formData.append('file', file)
+      fetch('http://localhost:5000/api/resume/analyze', {
+        method: 'POST',
+        body: formData
+      }).then(res => res.json()).then(processData).catch(handleError)
+    }
+
+    // Fake progress bar that stops at 90% waiting for API
     let p = 0
-    const iv = setInterval(() => {
+    window.analyzeInterval = setInterval(() => {
       p += Math.random() * 18 + 4
-      if (p >= 100) { p = 100; clearInterval(iv); setTimeout(() => setStep('results'), 400) }
+      if (p >= 90) p = 90
       setProgress(Math.min(p, 100))
     }, 200)
+    
+    function processData(data) {
+        clearInterval(window.analyzeInterval)
+        setProgress(100)
+        setResults(data)
+        setTimeout(() => setStep('results'), 400)
+    }
+    
+    function handleError(err) {
+        clearInterval(window.analyzeInterval)
+        console.error(err)
+        alert("Error analyzing resume. Make sure Python AI service is running.")
+        setStep('upload')
+    }
   }
 
   function handleDrop(e) {
@@ -41,7 +62,7 @@ export default function ResumeAnalyzer() {
     if (file) handleFile(file)
   }
 
-  function handleReset() { setStep('upload'); setFileName(null); setProgress(0); setResumeText('') }
+  function handleReset() { setStep('upload'); setFileName(null); setProgress(0); setResumeText(''); setResults(null); }
 
   const impactColor = { High: '#10b981', Critical: '#ef4444', Medium: '#f59e0b' }
 
@@ -137,7 +158,7 @@ export default function ResumeAnalyzer() {
           )}
 
           {/* RESULTS */}
-          {step === 'results' && (
+          {step === 'results' && results && (
             <motion.div key="results" initial={{ opacity: 0, y: 16 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.5 }}>
               {/* Header */}
               <div className="glass" style={{ padding: '20px 24px', marginBottom: 20, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
@@ -145,11 +166,11 @@ export default function ResumeAnalyzer() {
                   <FileText size={18} color="#6366f1" />
                   <div>
                     <div style={{ fontSize: 14, fontWeight: 600, color: '#e2e8f0' }}>{fileName}</div>
-                    <div style={{ fontSize: 12, color: '#475569' }}>Analysis complete · {MOCK_SKILLS.found.length} skills found</div>
+                    <div style={{ fontSize: 12, color: '#475569' }}>Analysis complete · {results.found?.length || 0} skills found</div>
                   </div>
                 </div>
                 <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-                  <div style={{ fontSize: 13, fontWeight: 700, color: '#10b981' }}>Match Score: 78%</div>
+                  <div style={{ fontSize: 13, fontWeight: 700, color: '#10b981' }}>Match Score: {results.matchScore || 0}%</div>
                   <button id="reset-resume-btn" onClick={handleReset} style={{ background: 'transparent', border: 'none', cursor: 'pointer', color: '#475569' }}><X size={16} /></button>
                 </div>
               </div>
@@ -160,12 +181,15 @@ export default function ResumeAnalyzer() {
                   <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 16 }}>
                     <CheckCircle size={16} color="#10b981" />
                     <span style={{ fontSize: 14, fontWeight: 600, color: '#e2e8f0' }}>Detected Skills</span>
-                    <span className="badge badge-success" style={{ marginLeft: 'auto' }}>{MOCK_SKILLS.found.length} found</span>
+                    <span className="badge badge-success" style={{ marginLeft: 'auto' }}>{results.found?.length || 0} found</span>
                   </div>
                   <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
-                    {MOCK_SKILLS.found.map(s => (
+                    {results.found && results.found.map(s => (
                       <span key={s} style={{ padding: '4px 12px', background: 'rgba(16,185,129,0.1)', border: '1px solid rgba(16,185,129,0.2)', borderRadius: 20, fontSize: 12, color: '#10b981', fontWeight: 500 }}>{s}</span>
                     ))}
+                    {(!results.found || results.found.length === 0) && (
+                      <span style={{ fontSize: 12, color: '#64748b' }}>No recognizable skills found.</span>
+                    )}
                   </div>
                 </div>
 
@@ -174,17 +198,17 @@ export default function ResumeAnalyzer() {
                   <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 16 }}>
                     <AlertCircle size={16} color="#ef4444" />
                     <span style={{ fontSize: 14, fontWeight: 600, color: '#e2e8f0' }}>Skill Gaps</span>
-                    <span className="badge badge-danger" style={{ marginLeft: 'auto' }}>{MOCK_SKILLS.gaps.length} missing</span>
+                    <span className="badge badge-danger" style={{ marginLeft: 'auto' }}>{results.gaps?.length || 0} missing</span>
                   </div>
                   <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginBottom: 16 }}>
-                    {MOCK_SKILLS.gaps.map(s => (
+                    {results.gaps && results.gaps.map(s => (
                       <span key={s} style={{ padding: '4px 12px', background: 'rgba(239,68,68,0.1)', border: '1px solid rgba(239,68,68,0.2)', borderRadius: 20, fontSize: 12, color: '#ef4444', fontWeight: 500 }}>{s}</span>
                     ))}
                   </div>
                   <div style={{ height: 1, background: 'rgba(99,102,241,0.1)', marginBottom: 12 }} />
                   <div style={{ fontSize: 12, color: '#64748b', marginBottom: 8 }}>🚀 Trending in your target market</div>
                   <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
-                    {MOCK_SKILLS.trending.map(s => (
+                    {results.trendingMissed && results.trendingMissed.map(s => (
                       <span key={s} style={{ padding: '4px 12px', background: 'rgba(99,102,241,0.1)', border: '1px solid rgba(99,102,241,0.2)', borderRadius: 20, fontSize: 12, color: '#818cf8', fontWeight: 500 }}>{s}</span>
                     ))}
                   </div>
@@ -195,15 +219,18 @@ export default function ResumeAnalyzer() {
               <div className="glass" style={{ padding: '22px 24px' }}>
                 <h3 style={{ fontSize: 14, fontWeight: 600, color: '#e2e8f0', marginBottom: 16 }}>Recommended Learning Path</h3>
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-                  {MOCK_SUGGESTIONS.map(s => (
-                    <div key={s.course} style={{ display: 'flex', alignItems: 'center', gap: 16, padding: '14px 16px', background: 'rgba(255,255,255,0.03)', borderRadius: 10, border: '1px solid rgba(99,102,241,0.1)' }}>
+                  {results.suggestions && results.suggestions.map((s, i) => (
+                    <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 16, padding: '14px 16px', background: 'rgba(255,255,255,0.03)', borderRadius: 10, border: '1px solid rgba(99,102,241,0.1)' }}>
                       <div style={{ flex: 1 }}>
-                        <div style={{ fontSize: 13, fontWeight: 600, color: '#e2e8f0', marginBottom: 3 }}>{s.course}</div>
-                        <div style={{ fontSize: 11, color: '#475569' }}>{s.platform} · {s.time}</div>
+                        <div style={{ fontSize: 13, fontWeight: 600, color: '#e2e8f0', marginBottom: 3 }}>Upskill: {s.skill}</div>
+                        <div style={{ fontSize: 11, color: '#475569' }}>Platform: {s.platform} · Expected Time: {s.duration}</div>
                       </div>
-                      <span className={`badge badge-${s.impact === 'Critical' ? 'danger' : s.impact === 'High' ? 'success' : 'warning'}`}>{s.impact}</span>
+                      <span className={`badge badge-${s.impact === 'Critical' ? 'danger' : s.impact === 'High' ? 'success' : 'warning'}`}>{s.impact} Impact</span>
                     </div>
                   ))}
+                  {(!results.suggestions || results.suggestions.length === 0) && (
+                    <div style={{ fontSize: 12, color: '#64748b' }}>No suggestions available based on your profile.</div>
+                  )}
                 </div>
               </div>
             </motion.div>

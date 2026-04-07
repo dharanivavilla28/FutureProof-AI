@@ -1,14 +1,95 @@
 const express = require('express')
 const cors = require('cors')
 const dotenv = require('dotenv')
+const multer = require('multer')
+const axios = require('axios')
+const FormData = require('form-data')
+const mongoose = require('mongoose')
+const jwt = require('jsonwebtoken')
+const Redis = require('ioredis')
+const User = require('./models/User')
 
 dotenv.config()
 
 const app = express()
 const PORT = process.env.PORT || 5000
+const FASTAPI_URL = process.env.FASTAPI_URL || 'http://localhost:8000'
+const MONGO_URI = process.env.MONGO_URI || 'mongodb://localhost:27017/futureproof'
+const JWT_SECRET = process.env.JWT_SECRET || 'supersecretjwtkey'
+
+// Connect to Database
+mongoose.connect(MONGO_URI).then(() => {
+  console.log('📦 Connected to MongoDB')
+}).catch(err => {
+  console.warn('⚠️ MongoDB not detected. Running without persistent storage.')
+})
+
+// Connect to Redis
+let redis;
+try {
+  redis = new Redis({ host: '127.0.0.1', port: 6379, maxRetriesPerRequest: 1, showFriendlyErrorStack: true });
+  redis.on('error', (err) => {
+    console.warn('⚠️ Redis not detected. Caching will be skipped.')
+    redis.disconnect()
+    redis = null
+  })
+} catch (e) { redis = null; }
 
 app.use(cors())
 app.use(express.json())
+
+// Setup multer for memory storage
+const upload = multer({ storage: multer.memoryStorage() })
+
+// ─── Middleware ───────────────────────────────────────────────────────────────
+
+const cacheMiddleware = (keyPrefix) => async (req, res, next) => {
+  if (!redis) return next()
+  const key = `${keyPrefix}:${req.originalUrl}`
+  try {
+    const cachedData = await redis.get(key)
+    if (cachedData) return res.json(JSON.parse(cachedData))
+    res.sendResponse = res.json
+    res.json = (body) => {
+      redis.setex(key, 3600, JSON.stringify(body)) // cache for 1 hour
+      res.sendResponse(body)
+    }
+    next()
+  } catch (err) { next() }
+}
+
+const protect = async (req, res, next) => {
+  let token;
+  if (req.headers.authorization && req.headers.authorization.startsWith('Bearer')) {
+    try {
+      token = req.headers.authorization.split(' ')[1]
+      const decoded = jwt.verify(token, JWT_SECRET)
+      req.user = await User.findById(decoded.id).select('-password')
+      next()
+    } catch (error) { res.status(401).json({ error: 'Not authorized, token failed' }) }
+  } else { res.status(401).json({ error: 'Not authorized, no token' }) }
+}
+
+// ─── Auth Routes ──────────────────────────────────────────────────────────────
+app.post('/api/auth/register', async (req, res) => {
+  const { email, password, name } = req.body
+  try {
+    const userExists = await User.findOne({ email })
+    if (userExists) return res.status(400).json({ error: 'User already exists' })
+    const user = await User.create({ email, password, name })
+    res.status(201).json({ _id: user._id, name: user.name, email: user.email, token: jwt.sign({ id: user._id }, JWT_SECRET, { expiresIn: '30d' }) })
+  } catch (err) { res.status(500).json({ error: err.message }) }
+})
+
+app.post('/api/auth/login', async (req, res) => {
+  const { email, password } = req.body
+  try {
+    const user = await User.findOne({ email })
+    if (user && (await user.matchPassword(password))) {
+      res.json({ _id: user._id, name: user.name, email: user.email, token: jwt.sign({ id: user._id }, JWT_SECRET, { expiresIn: '30d' }) })
+    } else { res.status(401).json({ error: 'Invalid email or password' }) }
+  } catch (err) { res.status(500).json({ error: err.message }) }
+})
 
 // ─── Mock Data ────────────────────────────────────────────────────────────────
 
@@ -60,92 +141,125 @@ app.get('/api/health', (req, res) => {
 })
 
 // Resume Analysis
-app.post('/api/resume/analyze', (req, res) => {
-  const { text } = req.body
-  if (!text) return res.status(400).json({ error: 'Resume text is required' })
+app.post('/api/resume/analyze', upload.single('file'), async (req, res) => {
+  try {
+    let found = [];
+    
+    // Check if it's a file upload or text payload
+    if (req.file) {
+      const formData = new FormData()
+      formData.append('file', req.file.buffer, { filename: req.file.originalname })
+      
+      const aiRes = await axios.post(`${FASTAPI_URL}/analyze-resume`, formData, {
+        headers: formData.getHeaders()
+      })
+      found = aiRes.data.found || []
+    } else if (req.body.text) {
+      // Keep backward compatibility for raw text pasting if needed
+      found = extractSkills(req.body.text)
+    } else {
+      return res.status(400).json({ error: 'Resume file or text is required' })
+    }
 
-  const found = extractSkills(text)
-  const gaps  = computeGaps(found)
-  const score = computeMatchScore(found)
+    const gaps  = computeGaps(found)
+    const score = computeMatchScore(found)
 
-  const suggestions = gaps.map(g => ({
-    skill:    g,
-    platform: ['Coursera', 'Udemy', 'DeepLearning.AI', 'edX'][Math.floor(Math.random() * 4)],
-    impact:   skillDatabase[g]?.svi >= 85 ? 'High' : 'Medium',
-    duration: `${Math.floor(Math.random() * 8) + 2} weeks`,
-  }))
+    const suggestions = gaps.map(g => ({
+      skill:    g,
+      platform: ['Coursera', 'Udemy', 'DeepLearning.AI', 'edX'][Math.floor(Math.random() * 4)],
+      impact:   skillDatabase[g]?.svi >= 85 ? 'High' : 'Medium',
+      duration: `${Math.floor(Math.random() * 8) + 2} weeks`,
+    }))
 
-  res.json({ found, gaps, trendingMissed: trendingSkills.filter(t => !found.includes(t.toLowerCase())), matchScore: score, suggestions })
+    // Save to user history if authenticated
+    if (req.headers.authorization && req.headers.authorization.startsWith('Bearer')) {
+      try {
+        const token = req.headers.authorization.split(' ')[1]
+        const decoded = jwt.verify(token, JWT_SECRET)
+        const user = await User.findById(decoded.id)
+        if (user) {
+          user.history.push({ skills_found: found, gaps: gaps, match_score: score })
+          await user.save()
+        }
+      } catch (e) { console.warn("Could not save to history:", e.message) }
+    }
+
+    res.json({ found, gaps, trendingMissed: trendingSkills.filter(t => !found.includes(t.toLowerCase())), matchScore: score, suggestions })
+  } catch (err) {
+    console.error('Error analyzing resume:', err.message)
+    res.status(500).json({ error: 'Failed to analyze resume' })
+  }
 })
 
 // Skill Volatility Index
-app.get('/api/svi', (req, res) => {
-  const result = Object.entries(skillDatabase).map(([name, data]) => ({
-    name: name.charAt(0).toUpperCase() + name.slice(1),
-    ...data,
-    status: data.svi >= 80 ? 'rising' : data.svi >= 65 ? 'stable' : data.svi >= 45 ? 'declining' : 'obsolete',
-  }))
-  res.json({ skills: result, lastUpdated: new Date().toISOString() })
+app.get('/api/svi', cacheMiddleware('svi'), async (req, res) => {
+  try {
+    const aiRes = await axios.get(`${FASTAPI_URL}/svi`)
+    res.json({ 
+      skills: aiRes.data.skills, 
+      lastUpdated: new Date().toISOString(),
+      model: aiRes.data.model
+    })
+  } catch (err) {
+    console.error('Error fetching SVI:', err.message)
+    res.status(500).json({ error: 'Failed to compute SVI via Python service' })
+  }
 })
 
 // Skill Synergy
-app.get('/api/synergy', (req, res) => {
-  const nodes = Object.entries(skillDatabase).map(([id, d]) => ({ id, ...d }))
-  const edges = [
-    { source: 'python', target: 'tensorflow' },
-    { source: 'python', target: 'mlops'      },
-    { source: 'python', target: 'sql'        },
-    { source: 'react',  target: 'typescript' },
-    { source: 'docker', target: 'kubernetes' },
-    { source: 'aws',    target: 'kubernetes' },
-    { source: 'langchain', target: 'python'  },
-    { source: 'tensorflow', target: 'mlops'  },
-  ]
-  res.json({ nodes, edges, bridgeSkills: ['mlops', 'langchain'] })
+app.get('/api/synergy', cacheMiddleware('synergy'), async (req, res) => {
+  try {
+    const aiRes = await axios.get(`${FASTAPI_URL}/synergy`)
+    res.json(aiRes.data)
+  } catch (err) {
+    console.error('Error fetching Synergy:', err.message)
+    res.status(500).json({ error: 'Failed to compute Synergy Graph via Python service' })
+  }
 })
 
 // ROI Path  
-app.post('/api/roi', (req, res) => {
+app.post('/api/roi', async (req, res) => {
   const { targetRole, currentSkills = [] } = req.body
   if (!targetRole) return res.status(400).json({ error: 'Target role is required' })
 
-  const roleMap = {
-    'ML Engineer':       { salary: { current: 85000, target: 160000 }, timeline: '14 months' },
-    'Data Scientist':    { salary: { current: 80000, target: 145000 }, timeline: '12 months' },
-    'Full Stack Developer': { salary: { current: 75000, target: 135000 }, timeline: '10 months' },
-    'DevOps Engineer':   { salary: { current: 80000, target: 140000 }, timeline: '11 months' },
+  try {
+    const aiRes = await axios.post(`${FASTAPI_URL}/roi`, { targetRole, currentSkills })
+    
+    // Mix FastAPI graph data with Node business logic
+    const roleData = { salary: { current: 80000, target: 130000 }, timeline: `${aiRes.data.estimated_months} months` }
+    const roi = Math.round(((roleData.salary.target - roleData.salary.current) / roleData.salary.current) * 100)
+
+    res.json({
+      role: targetRole,
+      salary: roleData.salary,
+      timeline: roleData.timeline,
+      roiPercent: roi,
+      estimatedCost: 2500,
+      estimatedROI: roleData.salary.target - roleData.salary.current - 2500,
+      graphPath: aiRes.data.path
+    })
+  } catch (err) {
+    console.error('Error fetching ROI:', err.message)
+    res.status(500).json({ error: 'Failed to compute ROI Path' })
   }
-
-  const roleData = roleMap[targetRole] || { salary: { current: 80000, target: 130000 }, timeline: '12 months' }
-  const roi = Math.round(((roleData.salary.target - roleData.salary.current) / roleData.salary.current) * 100)
-
-  res.json({
-    role: targetRole,
-    salary: roleData.salary,
-    timeline: roleData.timeline,
-    roiPercent: roi,
-    estimatedCost: 2500,
-    estimatedROI: roleData.salary.target - roleData.salary.current - 2500,
-  })
 })
 
 // Stress Test
-app.post('/api/stress-test', (req, res) => {
+app.post('/api/stress-test', async (req, res) => {
   const { role, year = 2030 } = req.body
   if (!role) return res.status(400).json({ error: 'Role is required' })
 
-  const automationRisk   = year >= 2030 ? 0.45 : year >= 2028 ? 0.3 : 0.15
-  const readinessScore   = Math.round(Math.max(20, 90 - automationRisk * 80 + Math.random() * 10))
-  const obsoleteCount    = Math.round(automationRisk * 6)
-
-  res.json({
-    role, year,
-    readinessScore,
-    automationRisk: `${Math.round(automationRisk * 100)}%`,
-    obsoleteSkills:  ['jQuery', 'REST-only APIs', 'Monolithic Architecture', 'Manual Testing', 'VBA', 'COBOL'].slice(0, obsoleteCount),
-    requiredSkills:  risingSkills.slice(0, 4),
-    predictionLabel: readinessScore >= 75 ? 'Future-Ready' : readinessScore >= 55 ? 'At Risk' : 'High Risk',
-  })
+  try {
+    const aiRes = await axios.post(`${FASTAPI_URL}/stress-test`, { role, year })
+    
+    res.json({
+      role, year,
+      ...aiRes.data
+    })
+  } catch (err) {
+    console.error('Error fetching Stress Test:', err.message)
+    res.status(500).json({ error: 'Failed to run ML Stress Test' })
+  }
 })
 
 // ─── Start ─────────────────────────────────────────────────────────────────────
